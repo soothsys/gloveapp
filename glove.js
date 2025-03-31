@@ -1,3 +1,11 @@
+/*
+ * Smart Glove Demo v1.0
+ *
+ * Copyright (C) 2025 Soothsayer Systems Ltd. All rights reserved.
+ *
+ * Author: Tom Coates <tom@soothsys.com>
+ */
+
 const DEVICE_NAME = 'SmartGlove';
 const IS_LITTLE_ENDIAN = true; //BLE protocol is little endian
 const NAME_DESCRIPTOR_UUID = BluetoothUUID.canonicalUUID('0x2901');
@@ -35,11 +43,12 @@ const supportedServices = new Map([
 	[BluetoothUUID.canonicalUUID(0x180F), 'Battery'],
 	[BluetoothUUID.canonicalUUID(0x181A), 'Environmental Sensor'],
 	[BluetoothUUID.canonicalUUID(0x054D), 'Light Sensor'],
-	['606a0692-1e69-422a-9f73-de87d239aade', 'Inertial Measurement Unit']
+	['606a0692-1e69-422a-9f73-de87d239aade', 'Inertial Measurement Unit'],
+	['7749eb1b-2b16-4d32-8422-e792dae7adb8', 'Magnetic Field Sensor']
 ]);
 
-const presInfoCache = new Map();
-const characteristicList = new Map();
+const readCharacteristicList = new Map();
+const writeCharacteristicList = new Map();
 const log = new Map();
 
 const statusBox = document.getElementById('statusBox');
@@ -94,38 +103,35 @@ function bluetoothConnect() {
 		return;
 	}
 
-	presInfoCache.clear();
-	characteristicList.clear();
+	readCharacteristicList.clear();
+	writeCharacteristicList.clear();
 
 	disableButton(bttnConnect);
 	console.log('Opening Bluetooth connection...');
 	navigator.bluetooth.requestDevice({
 		filters: [{ name: DEVICE_NAME }],
 		optionalServices: getSupportedUuids()
-	})
-		.then(device => {
-			console.log('Connected to: ', device.name);
-			statusOk('Connected to ' + device.name);
-			enableButton(bttnLogStart);
-			disableButton(bttnLogStop);
-			device.addEventListener('gattservicedisconnected', onDisconnect);
-			return device.gatt.connect();
-		})
-		.then(gattServer => {
-			bleServer = gattServer;
-			console.log('GATT server connected');
-			return bleServer.getPrimaryServices();
-		})
-		.then(services => initServices(services))
-		.catch(error => {
-			if (bleServer && bleServer.connected) {
-				bleServer.disconnect();
-			}
+	}).then(device => {
+		console.log('Connected to: ', device.name);
+		statusOk('Connected to ' + device.name);
+		enableButton(bttnLogStart);
+		disableButton(bttnLogStop);
+		device.addEventListener('gattservicedisconnected', onDisconnect);
+		return device.gatt.connect();
+	}).then(gattServer => {
+		bleServer = gattServer;
+		console.log('GATT server connected');
+		return bleServer.getPrimaryServices();
+	}).then(services => initServices(services))
+	.catch(error => {
+		if (bleServer && bleServer.connected) {
+			bleServer.disconnect();
+		}
 
-			console.log('Error connecting to Bluetooth device: ', error);
-			statusFail('Error connecting to Bluetooth device');
-			enableButton(bttnConnect);
-		});
+		console.log('Error connecting to Bluetooth device: ', error);
+		statusFail('Error connecting to Bluetooth device');
+		enableButton(bttnConnect);
+	});
 }
 
 function onDisconnect(event) {
@@ -145,19 +151,86 @@ function getSupportedUuids() {
 function initServices(services) {
 	for (const service of services) {
 		if (supportedServices.has(service.uuid)) {
-			initService(service);
+			const serviceName = supportedServices.get(service.uuid);
+			console.log('Found service "', serviceName, '" with UUID "', service.uuid, '"');
+
+			const table = showService(service.uuid, serviceName);
+			service.getCharacteristics().then(characteristics => initCharacteristics(table, serviceName, characteristics));
 		} else {
 			console.log('Found unsupported service with UUID "', service.uuid, '"');
 		}
 	}
 }
 
-function initService(service) {
-	const serviceName = supportedServices.get(service.uuid);
-	console.log('Found service "', serviceName, '" with UUID "', service.uuid, '"');
+function initCharacteristics(table, serviceName, characteristics) {
+	const decoder = new TextDecoder();
+	for (const characteristic of characteristics) {
+		let characteristicName = '';
+		characteristic.getDescriptor(NAME_DESCRIPTOR_UUID).then(nameDescriptor => {
+			return nameDescriptor.readValue();
+		}).then(arrBuffer => {
+			characteristicName = decoder.decode(arrBuffer);
+			console.log('Found characteristic "', characteristicName, '" with UUID "', characteristic.uuid, '"');
 
+			//All characteristics should have Read and Notify properties set at minimum, ignore any that don't
+			if (characteristic.properties.read && characteristic.properties.notify) {			
+				if (characteristic.properties.write) { //Writeable characteristics should also have Write property set
+					initWriteCharacteristic(table, characteristic, characteristicName);
+				} else { //Otherwise it must be a read-only characteristic
+					initReadCharacteristic(table, serviceName, characteristic, characteristicName);
+				}
+			}
+		});
+	}
+}
+
+function initReadCharacteristic(table, serviceName, characteristic, characteristicName) {
+	characteristic.getDescriptor(PRES_DESCRIPTOR_UUID).then(presDescriptor => {
+		return presDescriptor.readValue();
+	}).then(presDataView => {
+		const presInfo = readPresInfo(presDataView);
+		if (presInfo) {
+			characteristic.readValue().then(valDataView => {
+				const characteristicInfo = {
+					name: characteristicName,
+					serviceName: serviceName,
+					presInfo: presInfo,
+					lastEntry: ''
+				};
+
+				readCharacteristicList.set(characteristic.uuid, characteristicInfo);
+				showReadCharacteristic(table, characteristic.uuid, characteristicName);
+				updateVal(characteristic.uuid, valDataView, presInfo);
+				characteristic.addEventListener('characteristicvaluechanged', onNotify);
+				characteristic.startNotifications();
+				console.log('Started notifications for UUID "', characteristic.uuid, '"');
+			});
+		}
+	});
+}
+
+function initWriteCharacteristic(table, characteristic, characteristicName) {
+	writeCharacteristicList.set(characteristic.uuid, characteristic);
+	showWriteCharacteristic(table, characteristic.uuid, characteristicName);
+	characteristic.startNotifications();
+	console.log('Started notifications for UUID "', characteristic.uuid, '"');
+}
+
+function readPresInfo(dataView) {
+	if (dataView.byteLength < PRES_DESCRIPTOR_LENGTH) {
+		console.log('Characteristic presentation descriptor received was in invalid format');
+	} else {
+		const presInfo = {};
+		presInfo.format = dataView.getUint8(0);
+		presInfo.exponent = dataView.getInt8(1);
+		presInfo.unit = dataView.getUint16(2, IS_LITTLE_ENDIAN);
+		return presInfo;
+	}
+}
+
+function showService(uuid, serviceName) {
 	let serviceDiv = document.createElement('div');
-	serviceDiv.id = service.uuid;
+	serviceDiv.id = uuid;
 	serviceDiv.className = 'serviceBox';
 	servicesArea.appendChild(serviceDiv);
 
@@ -172,60 +245,11 @@ function initService(service) {
 	titleCell.className = 'serviceName';
 	titleCell.innerHTML = serviceName;
 	titleRow.appendChild(titleCell);
-
-	service.getCharacteristics().then(characteristics => {
-		initCharacteristics(table, serviceName, characteristics);
-	});
+	
+	return table;
 }
 
-function initCharacteristics(table, serviceName, characteristics) {
-	const decoder = new TextDecoder();
-	for (const characteristic of characteristics) {
-		let characteristicName = '';
-		characteristic.getDescriptor(NAME_DESCRIPTOR_UUID).then(nameDescriptor => {
-			return nameDescriptor.readValue();
-		}).then(arrBuffer => {
-			characteristicName = decoder.decode(arrBuffer);
-			console.log('Found characteristic "', characteristicName, '" with UUID "', characteristic.uuid, '"');
-			return characteristic.getDescriptor(PRES_DESCRIPTOR_UUID);
-		}).then(presDescriptor => {
-			return presDescriptor.readValue();
-		}).then(presDataView => {
-			const presInfo = readPresInfo(presDataView);
-			if (presInfo) {
-				presInfoCache.set(characteristic.uuid, presInfo);
-				characteristic.readValue().then(valDataView => {
-					const characteristicInfo = {
-						name: characteristicName,
-						serviceName: serviceName,
-						lastEntry: ''
-					};
-
-					characteristicList.set(characteristic.uuid, characteristicInfo);
-					showCharacteristic(table, characteristic.uuid, characteristicName);
-					updateVal(characteristic.uuid, valDataView, presInfo);
-					characteristic.addEventListener('characteristicvaluechanged', onNotify);
-					characteristic.startNotifications();
-					console.log('Started notifications for UUID "', characteristic.uuid, '"');
-				});
-			}
-		});
-	}
-}
-
-function readPresInfo(dataView) {
-	if (dataView.byteLength < PRES_DESCRIPTOR_LENGTH) {
-		console.log('Characteristic presentation descriptor received was in invalid format');
-	} else {
-		const presInfo = {};
-		presInfo.format = dataView.getUint8(0, IS_LITTLE_ENDIAN);
-		presInfo.exponent = dataView.getInt8(1, IS_LITTLE_ENDIAN);
-		presInfo.unit = dataView.getUint16(2, IS_LITTLE_ENDIAN);
-		return presInfo;
-	}
-}
-
-function showCharacteristic(table, uuid, characteristicName) {
+function showReadCharacteristic(table, uuid, characteristicName) {
 	let row = document.createElement('tr');
 	table.appendChild(row);
 
@@ -239,14 +263,41 @@ function showCharacteristic(table, uuid, characteristicName) {
 	row.appendChild(valCell);
 }
 
+function showWriteCharacteristic(table, uuid, characteristicName) {
+	let row = document.createElement('tr');
+	table.appendChild(row);
+
+	let cell = document.createElement('td');
+	cell.colSpan = 2;
+	row.appendChild(cell);
+
+	let bttn = document.createElement('button');
+	bttn.type = 'button';
+	bttn.id = uuid;
+	bttn.innerHTML = characteristicName;
+	bttn.addEventListener('click', onClick);
+	cell.appendChild(bttn);
+}
+
 function onNotify(event) {
-	if (!presInfoCache.has(event.target.uuid)) {
-		console.log('Presentation info descriptor not recorded for UUID "', event.target.uuid, '"');
+	if (!readCharacteristicList.has(event.target.uuid)) {
+		console.log('Received notification for unknown UUID "', event.target.uuid, '"');
 	} else {
-		const presInfo = presInfoCache.get(event.target.uuid);
-		if (presInfo) {
-			updateVal(event.target.uuid, event.target.value, presInfo);
-		}
+		const charInfo = readCharacteristicList.get(event.target.uuid);
+		updateVal(event.target.uuid, event.target.value, charInfo.presInfo);
+	}
+}
+
+function onClick(event) {
+	if (writeCharacteristicList.has(event.target.id)) {
+		let characteristic = writeCharacteristicList.get(event.target.id);
+		characteristic.readValue().then(dataView => {
+			if (dataView.byteLength >= 1) {
+				let val = dataView.getUint8(0);
+				dataView.setUint8(0, !val); //Invert the value...
+				characteristic.writeValueWithoutResponse(dataView.buffer); //...then write it back
+			}
+		});
 	}
 }
 
@@ -268,12 +319,12 @@ function readValue(dataView, presInfo) {
 	switch (presInfo.format) {
 		case BLE_FORMAT_BOOLEAN:
 			length = 1;
-			decodeFunc = (x) => { return (x.getUint8(0, IS_LITTLE_ENDIAN) != 0); };
+			decodeFunc = (x) => { return (x.getUint8(0) != 0); };
 			break;
 
 		case BLE_FORMAT_UINT8:
 			length = 1;
-			decodeFunc = (x) => { return x.getUint8(0, IS_LITTLE_ENDIAN); };
+			decodeFunc = (x) => { return x.getUint8(0); };
 			break;
 
 		case BLE_FORMAT_UINT16:
@@ -288,7 +339,7 @@ function readValue(dataView, presInfo) {
 
 		case BLE_FORMAT_SINT8:
 			length = 1;
-			decodeFunc = (x) => { return x.getInt8(0, IS_LITTLE_ENDIAN); };
+			decodeFunc = (x) => { return x.getInt8(0); };
 			break;
 
 		case BLE_FORMAT_SINT16:
@@ -353,8 +404,8 @@ function getUnitString(presInfo) {
 }
 
 function cacheValue(characteristicUuid, valStr) {
-	if (characteristicList.has(characteristicUuid)) {
-		const characteristicInfo = characteristicList.get(characteristicUuid);
+	if (readCharacteristicList.has(characteristicUuid)) {
+		const characteristicInfo = readCharacteristicList.get(characteristicUuid);
 		characteristicInfo.lastEntry = valStr;
 	}
 }
@@ -379,7 +430,7 @@ function logStop() {
 
 function updateLog() {
 	const logEntry = new Map();
-	characteristicList.forEach((characteristicInfo, uuid, map) => {
+	readCharacteristicList.forEach((characteristicInfo, uuid, map) => {
 		logEntry.set(uuid, characteristicInfo.lastEntry);
 	});
 
@@ -391,12 +442,12 @@ function printLog() {
 	let csv = 'Timestamp,';
 	let line2 = ',';
 	let line3 = ',';
-	characteristicList.forEach((characteristicInfo, uuid, map) => {
+	readCharacteristicList.forEach((characteristicInfo, uuid, map) => {
 		csv += characteristicInfo.serviceName + ',';
 		line2 += characteristicInfo.name + ',';
-		if (presInfoCache.has(uuid)) {
-			const presInfo = presInfoCache.get(uuid);
-			line3 += getUnitString(presInfo);
+		if (readCharacteristicList.has(uuid)) {
+			const charInfo = readCharacteristicList.get(uuid);
+			line3 += getUnitString(charInfo.presInfo);
 		}
 
 		line3 += ',';
@@ -406,7 +457,7 @@ function printLog() {
 
 	log.forEach((logEntry, timestamp, map) => {
 		csv += '\n' + timestamp + ',';
-		characteristicList.forEach((characteristicInfo, uuid, charactertisticMap) => {
+		readCharacteristicList.forEach((characteristicInfo, uuid, charactertisticMap) => {
 			if (logEntry.has(uuid)) {
 				csv += logEntry.get(uuid);
 			}
